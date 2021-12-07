@@ -2,10 +2,11 @@
 """
 
 import logging
-import eventlet
+import asyncio
 import json
-import boto3
 import uuid
+from aiobotocore.session import get_session
+from asyncio_pool import AioPool
 
 
 log = logging.getLogger(__name__)
@@ -30,8 +31,7 @@ class SQSConsumer():
     """
 
     def __init__(self, concurrency=100):
-        self._sqs = boto3.resource('sqs')
-        self._pool = eventlet.GreenPool(size=concurrency)
+        self._concurrency = concurrency
         self._stop_consuming = False
         self._handers = {}
 
@@ -43,6 +43,7 @@ class SQSConsumer():
           - attempts (int):         Number of retries.
           - failure_queue (str):    Queue to send unsuccessful messages.
         """   
+
         def decorator(fn):
             if queue_name in self._handers:
                 log.warning("Handler already registered for queue %s", queue_name)
@@ -51,33 +52,25 @@ class SQSConsumer():
             self._handers[queue_name] = {"func": fn, "attempts": attempts, "failure_queue": failure_queue}
         return decorator
 
-    def start(self):
-        for queue_name in self._handers.keys():
-            self._pool.resize(self._pool.size + 1)
-            self._pool.spawn_n(self._start_consuming, queue_name)
-
-        self._pool.waitall()
-
-    def stop(self):
-        self._stop_consuming = True
-
-    def _enqueue(self, queue_name, message_body, group_id):
-        queue = self._sqs.get_queue_by_name(QueueName=queue_name)
-        queue.send_message(
+    async def _enqueue(self, sqs, queue_url, message_body, group_id):
+        response = await sqs.send_message(
+            QueueUrl=queue_url,
             MessageBody=json.dumps(message_body),
             MessageGroupId=group_id,
             MessageDeduplicationId=uuid.uuid4().hex
         )
+
+        self._raise_for_status(response)
         
-    def _handle_message(self, queue_name, message):        
+    async def _handle_message(self, sqs, queue_name, queue_url, message):        
         try:
-            message_body = json.loads(message.body)
+            message_body = json.loads(message["Body"])
             if not self._stop_consuming:
-                self._handers[queue_name]["func"](message_body)
+                await self._handers[queue_name]["func"](message_body)
             else:
                 # The consumer received stop consuming signal.
                 # Sending the message back to queue.
-                self._enqueue(queue_name, message_body, message.attributes.get("MessageGroupId"))
+                await self._enqueue(sqs, queue_url, message_body, message["Attributes"].get("MessageGroupId"))
 
         except Exception as ex:
             # If an exceptions occurs the message will be:
@@ -88,23 +81,35 @@ class SQSConsumer():
             max_attempts = self._handers[queue_name]["attempts"]
 
             if message_body["attempts"] < max_attempts:
-                log.info("Retring message %s. Cause: %s", message.message_id, str(ex))
+                log.warning("Retring message %s. Cause: %s", message["MessageId"], str(ex))
                 log.exception(ex)
 
-                self._enqueue(queue_name, message_body, message.attributes.get("MessageGroupId"))
+                await self._enqueue(sqs, queue_url, message_body, message["Attributes"].get("MessageGroupId"))
             else:
-                log.info("Max attempts reached for message %s. Cause: %s", message.message_id, str(ex))
+                log.error("Max attempts reached for message %s.", message["MessageId"])
+                log.exception(ex)
+
                 failure_queue = self._handers[queue_name]["failure_queue"]
 
                 if failure_queue:
-                    # del message_body["attempts"]
-                    self._enqueue(failure_queue, message_body, message.attributes.get("MessageGroupId"))
+                    response = await sqs.get_queue_url(QueueName=failure_queue)
+                    self._raise_for_status(response)
 
-    def _start_consuming(self, queue_name):
-        queue = self._sqs.get_queue_by_name(QueueName=queue_name)
+                    failure_queue_url = response['QueueUrl']
+                    await self._enqueue(sqs, failure_queue_url, message_body, message["Attributes"].get("MessageGroupId"))
+
+    async def _start_consuming(self, queue_name, sqs, pool):
+        response = await sqs.get_queue_url(QueueName=queue_name)
+        self._raise_for_status(response)
+
+        queue_url = response['QueueUrl']
         
         while not self._stop_consuming:
-            messages = queue.receive_messages(MaxNumberOfMessages=10, WaitTimeSeconds=1, AttributeNames=["All"])
+            response = await sqs.receive_message(QueueUrl=queue_url, MaxNumberOfMessages=10, WaitTimeSeconds=1, AttributeNames=["All"])
+            self._raise_for_status(response)
+
+            messages = response.get("Messages", [])
+
             log.info("%s messages received from %s", len(messages), queue_name)
             if not messages:
                 continue
@@ -113,12 +118,39 @@ class SQSConsumer():
             try:
                 for message in messages:
                     messages_to_delete.append({
-                        'Id': message.message_id,
-                        'ReceiptHandle': message.receipt_handle
+                        'Id': message['MessageId'],
+                        'ReceiptHandle': message['ReceiptHandle']
                     })
 
-                    self._pool.spawn_n(self._handle_message, queue_name, message)
+                    await pool.spawn(self._handle_message(sqs, queue_name, queue_url, message))
 
             finally:
-                log.info("Deleting %s messages", len(messages_to_delete))
-                queue.delete_messages(Entries=messages_to_delete)
+                if messages_to_delete:
+                    log.info("Deleting %s messages", len(messages_to_delete))
+                    response = await sqs.delete_message_batch(
+                        QueueUrl=queue_url,
+                        Entries=messages_to_delete
+                    )
+
+                    self._raise_for_status(response)
+
+    def _raise_for_status(self, response):
+        if response['ResponseMetadata']['HTTPStatusCode'] != 200:
+            raise Exception(response) 
+
+    async def _start_async(self):
+        session = get_session()
+        consumers = []
+        async with session.create_client('sqs') as sqs:
+            for queue_name in self._handers.keys():
+                pool = AioPool(size=self._concurrency)
+                consumers.append(asyncio.create_task(self._start_consuming(queue_name, sqs, pool)))
+
+            await asyncio.gather(*consumers)
+
+    def start(self):
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(self._start_async())
+
+    def stop(self):
+        self._stop_consuming = True
