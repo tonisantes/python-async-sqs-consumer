@@ -2,7 +2,7 @@
 
 Python client for consuming messages asynchronously from AWS Simple Queue Service (SQS).
 
-This provides a `SQSConcumer class` witch is able to consume multiple fifo queues from SQS.
+This provides a `SQSConsumer class` witch is able to consume multiple fifo queues from SQS.
 It uses `Asyncio` library in order to process the messages asynchronously with a predefined concurrency.
 It also is able to perform retries and give up messages, sending them to a failure queue.
 
