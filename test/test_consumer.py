@@ -54,32 +54,33 @@ def test_multiple_consumers():
         # - "After you create a queue, you must wait at least one second after the queue is created to be able to use the queue."
         time.sleep(1)
         
-        total_messages = 20
+        concurrency = 10
 
-        for _ in range(total_messages):
+        for _ in range(5):
             queue_1.send_message(
                 MessageBody=json.dumps({"name": "test1"}),
                 MessageGroupId="test1",
                 MessageDeduplicationId=uuid.uuid4().hex
             )
 
-        for _ in range(total_messages):
+        for _ in range(20):
             queue_2.send_message(
                 MessageBody=json.dumps({"name": "test2"}),
                 MessageGroupId="test2",
                 MessageDeduplicationId=uuid.uuid4().hex
             )
 
-        consumer = SQSConsumer(concurrency=total_messages)
+        consumer = SQSConsumer(concurrency=concurrency)
 
-        handler_calls = 0
+        handler_1_calls = 0
+        handler_2_calls = 0
 
         async def handle_message_1(message):
-            nonlocal handler_calls
+            nonlocal handler_1_calls
 
-            handler_calls += 1
+            handler_1_calls += 1
             
-            await asyncio.sleep(12)
+            await asyncio.sleep(5)
             consumer.stop()
 
         consumer.consume(
@@ -87,19 +88,23 @@ def test_multiple_consumers():
         )(handle_message_1)
 
         async def handle_message_2(message):
-            nonlocal handler_calls
+            nonlocal handler_2_calls
 
-            handler_calls += 1
+            if not consumer.is_running():
+                return
+
+            handler_2_calls += 1
             
-            await asyncio.sleep(10)
-            
+            await asyncio.sleep(7)
+
         consumer.consume(
             queue_name=queue_name_2,
         )(handle_message_2)
 
         consumer.start()
 
-        assert handler_calls == (total_messages * 2)
+        assert handler_1_calls == 5
+        assert handler_2_calls == 5
     finally:
         queue_1.delete()
         queue_2.delete()
@@ -155,6 +160,7 @@ def test_message_concurrency():
         time.sleep(1)
         
         total_messages = 40
+        concurrency = total_messages - 4
 
         for _ in range(total_messages):
             queue.send_message(
@@ -163,7 +169,7 @@ def test_message_concurrency():
                 MessageDeduplicationId=uuid.uuid4().hex
             )
 
-        consumer = SQSConsumer(concurrency=total_messages + 100)
+        consumer = SQSConsumer(concurrency=concurrency)
 
         handler_calls = 0
 
@@ -181,7 +187,7 @@ def test_message_concurrency():
 
         consumer.start()
         
-        assert handler_calls == total_messages
+        assert handler_calls == concurrency
     finally:
         queue.delete()
 

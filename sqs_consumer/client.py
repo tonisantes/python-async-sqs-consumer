@@ -13,9 +13,9 @@ log = logging.getLogger(__name__)
 
 
 class SQSConsumer():
-    """ This class is able to consume multiple queues from sqs.
-    It depends on a library (eventlet) to make the calls asynchronously with a predefined concurrency.
-    It also is able to preform retries.
+    """ This class is able to consume multiple fifo queues from SQS.
+    It uses `Asyncio` library in order to process the messages asynchronously with a predefined concurrency.
+    It also is able to perform retries and give up messages, sending them to a failure queue.
 
     Example:
         consumer = SQSConsumer()
@@ -24,7 +24,7 @@ class SQSConsumer():
             failure_queue="MyFailureQueue.fifo,
             attempts=10
         )
-        def handle_message(message):
+        async def handle_message(message):
             print(message)
 
         consumer.start()
@@ -142,11 +142,11 @@ class SQSConsumer():
         session = get_session()
         consumers = []
         async with session.create_client('sqs') as sqs:
-            for queue_name in self._handers.keys():
-                pool = AioPool(size=self._concurrency)
-                consumers.append(asyncio.create_task(self._start_consuming(queue_name, sqs, pool)))
+            async with AioPool(size=self._concurrency) as pool:
+                for queue_name in self._handers.keys():
+                    consumers.append(asyncio.create_task(self._start_consuming(queue_name, sqs, pool)))
 
-            await asyncio.gather(*consumers)
+                await asyncio.gather(*consumers)
 
     def start(self):
         loop = asyncio.get_event_loop()
@@ -154,3 +154,6 @@ class SQSConsumer():
 
     def stop(self):
         self._stop_consuming = True
+
+    def is_running(self):
+        return not self._stop_consuming
